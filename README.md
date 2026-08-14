@@ -16,7 +16,23 @@ uvx check_bag bag_filename --de
 
 # Show meta information: size, duration, number of messages, topics (name and type).
 uvx check_bag bag_filename --info
+
+# Check all ROS1 and ROS2 bags found under a directory (recursively).
+# --max-workers sets the number of worker processes (default: 8).
+uvx check_bag directory --folder --max-workers 8
 ```
+
+`--folder` first probes all bags in parallel to identify compressed ROS1 bags.
+Uncompressed bags are then checked in parallel (one process per bag). Compressed
+bags are each checked with `--max-workers-per-bag` processes for parallel chunk
+decompression; multiple compressed bags run concurrently when `--max-workers`
+provides enough workers (e.g. `--max-workers 16 --max-workers-per-bag 8` checks
+two compressed bags at a time).
+
+Single ROS1 bags are likewise checked by scanning their chunks in parallel
+with `--max-workers` processes, which greatly speeds up compressed (bz2/lz4)
+bags.
+
 
 `bag_filename` can be a ROS1 `.bag` file or a ROS2 bag directory.
 
