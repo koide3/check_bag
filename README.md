@@ -22,12 +22,14 @@ uvx check_bag bag_filename --info
 uvx check_bag directory --folder --max-workers 8
 ```
 
-With `--folder`, bags are ordered heavy-first (compressed ROS1 bags before
-uncompressed ones, larger before smaller) and dispatched against a budget of
-`--max-workers` worker processes: each ROS1 bag scans its chunks with
-`--max-workers-per-bag` processes, while each ROS2 bag uses a single process,
-so light bags fill the cores freed by heavy ones. Each result line reports
-the per-bag processing time, and the summary reports the total time.
+With `--folder`, all ROS1 bags share one global pool of `--max-workers`
+processes that scans their chunks (heavy bags queued first: compressed before
+uncompressed, larger before smaller), so every worker stays busy until the
+whole queue drains. ROS2 bags each run as a single-process task in the same
+pool and are submitted first so they overlap the chunk work. Each result line
+reports the per-bag processing time, and the summary reports the total time.
+Setting `--max-workers` to the number of CPU cores gives the fastest checks
+for compressed bags.
 
 Single ROS1 bags are likewise checked by scanning their chunks in parallel
 with `--max-workers` processes, which greatly speeds up compressed (bz2/lz4)
