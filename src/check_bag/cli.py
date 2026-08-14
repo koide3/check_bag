@@ -6,7 +6,9 @@ import argparse
 import os
 import struct
 import sys
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import threading
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from rosbags.highlevel import AnyReader
@@ -63,6 +65,7 @@ def check_messages(reader: AnyReader, *, deserialize: bool, quiet: bool) -> None
 
     Raises on any read or deserialization error.
     """
+    start = time.perf_counter()
     connections = list(reader.connections)
 
     if deserialize:
@@ -85,25 +88,34 @@ def check_messages(reader: AnyReader, *, deserialize: bool, quiet: bool) -> None
 
     if not quiet:
         mode = "deserialized" if deserialize else "read"
-        print(f"OK: {mode} {count} messages")
+        print(f"OK: {mode} {count} messages ({time.perf_counter() - start:.1f}s)")
 
 
 MSGDATA_OP = 0x02
+CHUNK_OP = 0x05
 
 _ros1_state: dict = {}
 
 
 def _ros1_worker_init(bag: str, deserialize: bool) -> None:
-    """Open the bag once per worker process."""
-    reader = open_bag(Path(bag))
-    reader.open()
-    msgtypes = {c.id: c.msgtype for c in reader.connections}
+    """Open the bag once per worker process.
+
+    Without deserialization only a raw file handle is needed; with it, the
+    full reader is opened to build the typestore from the bag definitions.
+    """
+    reader = None
+    msgtypes: dict[int, str] = {}
     if deserialize:
+        reader = open_bag(Path(bag))
+        reader.open()
         known = reader.typestore.fielddefs
-        msgtypes = {cid: t for cid, t in msgtypes.items() if t in known}
+        msgtypes = {c.id: c.msgtype for c in reader.connections if c.msgtype in known}
+        bio = reader.readers[0].bio
+    else:
+        bio = open(bag, "rb")  # noqa: SIM115 - closed on process exit
     _ros1_state.update(
         reader=reader,
-        r1=reader.readers[0],
+        bio=bio,
         msgtypes=msgtypes,
         deserialize=deserialize,
     )
@@ -156,18 +168,20 @@ def _scan_chunk(buf: bytes) -> int:
     return count
 
 
-def _ros1_scan_batch(positions: list[int]) -> int:
-    """Worker: decompress and scan a batch of chunks, return message count."""
-    r1 = _ros1_state["r1"]
+def _ros1_scan_batch(chunks: list[tuple[int, int, str]]) -> int:
+    """Worker: decompress and scan a batch of chunks, return message count.
+
+    Each chunk is described as (datapos, datasize, compression).
+    """
+    bio = _ros1_state["bio"]
     count = 0
-    for pos in positions:
-        chunk = r1.chunks[pos]
-        _ = r1.bio.seek(chunk.datapos)
-        data = r1.bio.read(chunk.datasize)
-        if len(data) != chunk.datasize:
-            msg = f"chunk at offset {pos} is truncated"
+    for datapos, datasize, compression in chunks:
+        _ = bio.seek(datapos)
+        data = bio.read(datasize)
+        if len(data) != datasize:
+            msg = f"chunk at offset {datapos} is truncated"
             raise ValueError(msg)
-        count += _scan_chunk(chunk.decompressor(data))
+        count += _scan_chunk(ros1_decompressors[compression](data))
     return count
 
 
@@ -177,9 +191,14 @@ def check_ros1_parallel(path: Path, *, deserialize: bool, quiet: bool, max_worke
     Raises on any read or deserialization error, and on a mismatch between
     the number of scanned messages and the bag index.
     """
+    start = time.perf_counter()
+    compression_names = {id(func): name for name, func in ros1_decompressors.items()}
     with open_bag(path) as reader:
         expected = reader.message_count
-        positions = sorted(reader.readers[0].chunks)
+        chunks = [
+            (chunk.datapos, chunk.datasize, compression_names[id(chunk.decompressor)])
+            for _, chunk in sorted(reader.readers[0].chunks.items())
+        ]
         if deserialize:
             known = reader.typestore.fielddefs
             unknown = sorted({c.msgtype for c in reader.connections if c.msgtype not in known})
@@ -188,13 +207,13 @@ def check_ros1_parallel(path: Path, *, deserialize: bool, quiet: bool, max_worke
                     print(f"ignoring non-standard type: {msgtype}")
 
     batchsize = 32
-    batches = [positions[i : i + batchsize] for i in range(0, len(positions), batchsize)]
+    batches = [chunks[i : i + batchsize] for i in range(0, len(chunks), batchsize)]
     count = 0
     with ProcessPoolExecutor(
         max_workers=max_workers, initializer=_ros1_worker_init, initargs=(str(path), deserialize)
     ) as executor:
         futures = {executor.submit(_ros1_scan_batch, batch): len(batch) for batch in batches}
-        with tqdm(total=len(positions), unit="chunk", disable=quiet) as progress:
+        with tqdm(total=len(chunks), unit="chunk", disable=quiet) as progress:
             for future in as_completed(futures):
                 count += future.result()
                 progress.update(futures[future])
@@ -204,7 +223,43 @@ def check_ros1_parallel(path: Path, *, deserialize: bool, quiet: bool, max_worke
         raise ValueError(msg)
     if not quiet:
         mode = "deserialized" if deserialize else "read"
-        print(f"OK: {mode} {count} messages")
+        print(f"OK: {mode} {count} messages ({time.perf_counter() - start:.1f}s)")
+
+
+def ros1_compression(path: Path) -> str:
+    """Peek at the first chunk record of a ROS1 bag to get its compression.
+
+    Only reads the head of the file; returns 'none' when undeterminable.
+    """
+    try:
+        with path.open("rb") as bagfile:
+            _ = bagfile.readline()  # version line, e.g. '#ROSBAG V2.0'
+            while True:
+                head = bagfile.read(4)
+                if len(head) < 4:
+                    return "none"
+                (hlen,) = struct.unpack("<I", head)
+                header = bagfile.read(hlen)
+                op = None
+                compression = None
+                idx = 0
+                while idx < hlen:
+                    (flen,) = struct.unpack_from("<I", header, idx)
+                    idx += 4
+                    fend = idx + flen
+                    eq = header.index(b"=", idx, fend)
+                    name = header[idx:eq]
+                    if name == b"op":
+                        op = header[eq + 1]
+                    elif name == b"compression":
+                        compression = header[eq + 1 : fend].decode()
+                    idx = fend
+                (dlen,) = struct.unpack("<I", bagfile.read(4))
+                if op == CHUNK_OP:
+                    return compression or "none"
+                _ = bagfile.seek(dlen, os.SEEK_CUR)
+    except Exception:  # noqa: BLE001 - only used for scheduling, not validity
+        return "none"
 
 
 def find_bags(folder: Path) -> list[Path]:
@@ -222,39 +277,20 @@ def find_bags(folder: Path) -> list[Path]:
 
 def process_bag(
     bag: str, deserialize: bool, info: bool, announce: bool = False
-) -> tuple[str, str | None, str | None]:
-    """Worker: check a single bag. Returns (bag, error, info_text)."""
+) -> tuple[str, str | None, str | None, float]:
+    """Worker: check a single bag. Returns (bag, error, info_text, elapsed)."""
     path = Path(bag)
     if announce:
         print(f"checking {bag}", flush=True)
+    start = time.perf_counter()
     try:
         with open_bag(path) as reader:
             if info:
-                return bag, None, format_info(reader, path)
+                return bag, None, format_info(reader, path), time.perf_counter() - start
             check_messages(reader, deserialize=deserialize, quiet=True)
     except Exception as exc:  # noqa: BLE001 - any failure means the bag is invalid
-        return bag, str(exc), None
-    return bag, None, None
-
-
-def probe_bag(bag: str) -> tuple[str, bool, str | None]:
-    """Worker: open a bag and report whether it uses chunk compression.
-
-    Returns (bag, is_compressed, error).
-    """
-    path = Path(bag)
-    try:
-        with open_bag(path) as reader:
-            compressed = False
-            if not reader.is2:
-                none_decompressor = ros1_decompressors["none"]
-                compressed = any(
-                    chunk.decompressor is not none_decompressor
-                    for chunk in reader.readers[0].chunks.values()
-                )
-    except Exception as exc:  # noqa: BLE001 - any failure means the bag is invalid
-        return bag, False, str(exc)
-    return bag, compressed, None
+        return bag, str(exc), None, time.perf_counter() - start
+    return bag, None, None, time.perf_counter() - start
 
 
 def check_folder(
@@ -268,12 +304,13 @@ def check_folder(
 ) -> int:
     """Check all bags found under a folder.
 
-    Bags are first probed in parallel to identify compressed ROS1 bags. All
-    uncompressed bags are then checked in parallel (one process per bag),
-    followed by compressed bags with ``max_workers_per_bag`` processes each,
-    running multiple compressed bags concurrently when ``max_workers``
-    provides enough workers.
+    Bags are ordered heavy-first (compressed ROS1 bags before uncompressed
+    bags, larger before smaller) and dispatched against a budget of
+    ``max_workers`` worker processes: each ROS1 bag scans its chunks with
+    ``max_workers_per_bag`` processes, while each ROS2 bag uses a single
+    process, so light bags fill the cores freed by heavy ones.
     """
+    start = time.perf_counter()
     bags = find_bags(folder)
     if not bags:
         print(f"error: no bags found in {folder}", file=sys.stderr)
@@ -281,13 +318,21 @@ def check_folder(
 
     failures: list[tuple[str, str]] = []
 
+    def summary() -> None:
+        total = time.perf_counter() - start
+        if not quiet:
+            print(
+                f"checked {len(bags)} bags: {len(bags) - len(failures)} ok,"
+                f" {len(failures)} failed in {total:.1f}s"
+            )
+
     if info:
         infos: dict[str, str] = {}
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(process_bag, str(bag), deserialize, True) for bag in bags]
             with tqdm(total=len(bags), unit="bag", disable=quiet) as progress:
                 for future in as_completed(futures):
-                    bag, error, info_text = future.result()
+                    bag, error, info_text, _elapsed = future.result()
                     if error is not None:
                         failures.append((bag, error))
                         progress.write(f"FAIL {bag}: {error}", file=sys.stderr)
@@ -298,91 +343,81 @@ def check_folder(
             if str(bag) in infos:
                 print(infos[str(bag)])
                 print()
-        if not quiet:
-            print(f"checked {len(bags)} bags: {len(bags) - len(failures)} ok, {len(failures)} failed")
+        summary()
         return 1 if failures else 0
 
-    # Stage 1: identify compressed bags by probing bag info in parallel.
-    compressed: list[str] = []
-    uncompressed: list[str] = []
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(probe_bag, str(bag)) for bag in bags]
-        with tqdm(total=len(bags), unit="bag", desc="probe", disable=quiet) as progress:
-            for future in as_completed(futures):
-                bag, is_compressed, error = future.result()
+    # Order bags heavy-first: compressed ROS1 bags before uncompressed ones
+    # and ROS2 bags, larger bags before smaller ones within each group.
+    ros1_paths = [bag for bag in bags if bag.is_file()]
+    light_paths = [bag for bag in bags if bag.is_dir()]  # ROS2
+    heavy_paths = []
+    for path in ros1_paths:
+        (heavy_paths if ros1_compression(path) != "none" else light_paths).append(path)
+    heavy_paths.sort(key=bag_size, reverse=True)
+    light_paths.sort(key=bag_size, reverse=True)
+
+    # Each ROS1 bag costs max_workers_per_bag workers (chunk-parallel scan),
+    # each ROS2 bag costs one worker. Bags are dispatched in order as soon
+    # as the max_workers budget allows.
+    workers_per_bag = min(max_workers_per_bag, max_workers)
+    tasks = [(path, workers_per_bag if path.is_file() else 1) for path in heavy_paths + light_paths]
+
+    budget = max_workers
+    cond = threading.Condition()
+    ros2_pool = ProcessPoolExecutor(max_workers=max_workers)
+    with tqdm(total=len(tasks), unit="bag", disable=quiet) as progress:
+
+        def run_task(path: Path, cost: int) -> None:
+            nonlocal budget
+            bag = str(path)
+            if not quiet:
+                tqdm.write(f"checking {bag}")
+            bag_start = time.perf_counter()
+            error = None
+            try:
+                if path.is_file():
+                    check_ros1_parallel(
+                        path, deserialize=deserialize, quiet=True, max_workers=cost
+                    )
+                else:
+                    _, error, _, _ = ros2_pool.submit(process_bag, bag, deserialize, False).result()
+            except Exception as exc:  # noqa: BLE001 - any failure means the bag is invalid
+                error = str(exc)
+            elapsed = time.perf_counter() - bag_start
+            with cond:
                 if error is not None:
                     failures.append((bag, error))
-                    progress.write(f"FAIL {bag}: {error}", file=sys.stderr)
-                elif is_compressed:
-                    compressed.append(bag)
-                else:
-                    uncompressed.append(bag)
-                progress.update(1)
+                budget += cost
+                cond.notify_all()
+            if error is not None:
+                progress.write(f"FAIL {bag}: {error} ({elapsed:.1f}s)", file=sys.stderr)
+            elif not quiet:
+                progress.write(f"OK   {bag} ({elapsed:.1f}s)")
+            progress.update(1)
 
-    # Stage 2: check uncompressed bags in parallel, one process per bag.
-    if uncompressed:
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(process_bag, bag, deserialize, False, not quiet)
-                for bag in sorted(uncompressed)
-            ]
-            with tqdm(total=len(uncompressed), unit="bag", desc="uncompressed", disable=quiet) as progress:
-                for future in as_completed(futures):
-                    bag, error, _ = future.result()
-                    if error is not None:
-                        failures.append((bag, error))
-                        progress.write(f"FAIL {bag}: {error}", file=sys.stderr)
-                    elif not quiet:
-                        progress.write(f"OK   {bag}")
-                    progress.update(1)
+        threads = []
+        for path, cost in tasks:
+            with cond:
+                while budget < cost:
+                    cond.wait()
+                budget -= cost
+            thread = threading.Thread(target=run_task, args=(path, cost))
+            thread.start()
+            threads.append(thread)
+        for thread in threads:
+            thread.join()
+    ros2_pool.shutdown()
 
-    # Stage 3: check compressed bags with multiple processes per bag, running
-    # several bags concurrently when there are enough workers.
-    if compressed:
-        workers_per_bag = min(max_workers_per_bag, max_workers)
-        slots = max(1, max_workers // workers_per_bag)
-        if slots == 1:
-            for bag in sorted(compressed):
-                if not quiet:
-                    print(f"checking {bag}")
-                try:
-                    check_ros1_parallel(
-                        Path(bag), deserialize=deserialize, quiet=quiet, max_workers=workers_per_bag
-                    )
-                except Exception as exc:  # noqa: BLE001 - any failure means the bag is invalid
-                    failures.append((bag, str(exc)))
-                    print(f"FAIL {bag}: {exc}", file=sys.stderr)
-        else:
-
-            def run_one(bag: str) -> tuple[str, str | None]:
-                if not quiet:
-                    tqdm.write(f"checking {bag}")
-                try:
-                    check_ros1_parallel(
-                        Path(bag), deserialize=deserialize, quiet=True, max_workers=workers_per_bag
-                    )
-                except Exception as exc:  # noqa: BLE001 - any failure means the bag is invalid
-                    return bag, str(exc)
-                return bag, None
-
-            with ThreadPoolExecutor(max_workers=slots) as pool:
-                thread_futures = [pool.submit(run_one, bag) for bag in sorted(compressed)]
-                with tqdm(total=len(compressed), unit="bag", desc="compressed", disable=quiet) as progress:
-                    for future in as_completed(thread_futures):
-                        bag, error = future.result()
-                        if error is not None:
-                            failures.append((bag, error))
-                            progress.write(f"FAIL {bag}: {error}", file=sys.stderr)
-                        elif not quiet:
-                            progress.write(f"OK   {bag}")
-                        progress.update(1)
-
-    if not quiet:
-        print(f"checked {len(bags)} bags: {len(bags) - len(failures)} ok, {len(failures)} failed")
+    summary()
     return 1 if failures else 0
 
 
 def main() -> int:
+    # Line-buffer stdout even when piped, so forked worker processes never
+    # inherit (and re-flush) buffered output lines.
+    if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser(
         prog="check_bag",
         description="Check the validity of ROS1 and ROS2 bags.",
