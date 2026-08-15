@@ -90,6 +90,42 @@ def check_messages(reader: AnyReader, *, deserialize: bool, quiet: bool) -> None
         print(f"OK: {mode} {count} messages ({time.perf_counter() - start:.1f}s)")
 
 
+def check_quick(reader: AnyReader, *, deserialize: bool, quiet: bool) -> None:
+    """Check that the bag opens and its first and last messages are valid.
+
+    Raises on any read or deserialization error.
+    """
+    start = time.perf_counter()
+    if reader.message_count == 0:
+        if not quiet:
+            print(f"OK: quick check, bag opened (no messages) ({time.perf_counter() - start:.1f}s)")
+        return
+
+    first = next(reader.messages(), None)
+    if first is None:
+        msg = "bag index reports messages but none could be read"
+        raise ValueError(msg)
+    last = None
+    for entry in reader.messages(start=reader.end_time - 1):
+        last = entry
+    if last is None:
+        msg = "could not read the last message"
+        raise ValueError(msg)
+
+    if deserialize:
+        known = reader.typestore.fielddefs
+        for connection, _timestamp, rawdata in (first, last):
+            if connection.msgtype in known:
+                _ = reader.deserialize(rawdata, connection.msgtype)
+
+    if not quiet:
+        mode = "valid" if not deserialize else "deserialized"
+        print(
+            f"OK: quick check, first and last of {reader.message_count} messages {mode}"
+            f" ({time.perf_counter() - start:.1f}s)"
+        )
+
+
 MSGDATA_OP = 0x02
 CHUNK_OP = 0x05
 
@@ -269,7 +305,7 @@ def find_bags(folder: Path) -> list[Path]:
 
 
 def process_bag(
-    bag: str, deserialize: bool, info: bool, announce: bool = False
+    bag: str, deserialize: bool, info: bool, announce: bool = False, quick: bool = False
 ) -> tuple[str, str | None, str | None, float]:
     """Worker: check a single bag. Returns (bag, error, info_text, elapsed)."""
     path = Path(bag)
@@ -280,7 +316,10 @@ def process_bag(
         with open_bag(path) as reader:
             if info:
                 return bag, None, format_info(reader, path), time.perf_counter() - start
-            check_messages(reader, deserialize=deserialize, quiet=True)
+            if quick:
+                check_quick(reader, deserialize=deserialize, quiet=True)
+            else:
+                check_messages(reader, deserialize=deserialize, quiet=True)
     except Exception as exc:  # noqa: BLE001 - any failure means the bag is invalid
         return bag, str(exc), None, time.perf_counter() - start
     return bag, None, None, time.perf_counter() - start
@@ -291,6 +330,7 @@ def check_folder(
     *,
     deserialize: bool,
     info: bool,
+    quick: bool,
     quiet: bool,
     max_workers: int,
 ) -> int:
@@ -301,6 +341,8 @@ def check_folder(
     uncompressed, larger before smaller), so every worker stays busy until
     the whole queue drains. ROS2 bags each run as a single-process task in
     the same pool and are submitted first so they overlap the chunk work.
+    With ``quick``, every bag instead runs as a light single-process task
+    that only validates opening and the first and last messages.
     """
     start = time.perf_counter()
     bags = find_bags(folder)
@@ -335,6 +377,24 @@ def check_folder(
             if str(bag) in infos:
                 print(infos[str(bag)])
                 print()
+        summary()
+        return 1 if failures else 0
+
+    if quick:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            quick_futures = [
+                executor.submit(process_bag, str(bag), deserialize, False, not quiet, True)
+                for bag in bags
+            ]
+            with tqdm(total=len(bags), unit="bag", disable=quiet) as progress:
+                for future in as_completed(quick_futures):
+                    bag, error, _, elapsed = future.result()
+                    if error is not None:
+                        failures.append((bag, error))
+                        progress.write(f"FAIL {bag}: {error} ({elapsed:.1f}s)", file=sys.stderr)
+                    elif not quiet:
+                        progress.write(f"OK   {bag} ({elapsed:.1f}s)")
+                    progress.update(1)
         summary()
         return 1 if failures else 0
 
@@ -455,6 +515,11 @@ def main() -> int:
     )
     parser.add_argument("--de", action="store_true", help="deserialize messages (non-standard types are ignored)")
     parser.add_argument("--info", action="store_true", help="show meta information of the bag")
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="check only that the bag opens and its first and last messages are valid",
+    )
     parser.add_argument("--quiet", action="store_true", help="do not show progress")
     parser.add_argument(
         "--folder", action="store_true", help="check all ROS1 and ROS2 bags found under the specified directory"
@@ -485,12 +550,13 @@ def main() -> int:
             args.bag,
             deserialize=args.de,
             info=args.info,
+            quick=args.quick,
             quiet=args.quiet,
             max_workers=args.max_workers,
         )
 
     try:
-        if not args.info and args.bag.is_file() and args.max_workers > 1:
+        if not args.info and not args.quick and args.bag.is_file() and args.max_workers > 1:
             # ROS1 bags are single files; scan their chunks in parallel.
             check_ros1_parallel(
                 args.bag, deserialize=args.de, quiet=args.quiet, max_workers=args.max_workers
@@ -499,6 +565,8 @@ def main() -> int:
         with open_bag(args.bag) as reader:
             if args.info:
                 print(format_info(reader, args.bag))
+            elif args.quick:
+                check_quick(reader, deserialize=args.de, quiet=args.quiet)
             else:
                 check_messages(reader, deserialize=args.de, quiet=args.quiet)
     except Exception as exc:  # noqa: BLE001 - any failure means the bag is invalid

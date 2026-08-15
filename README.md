@@ -17,6 +17,10 @@ uvx check_bag bag_filename --de
 # Show meta information: size, duration, number of messages, topics (name and type).
 uvx check_bag bag_filename --info
 
+# Quick check: only verify that the bag opens and that its first and last
+# messages are valid (deserialized too when --de is given).
+uvx check_bag bag_filename --quick
+
 # Check all ROS1 and ROS2 bags found under a directory (recursively).
 # --max-workers sets the number of worker processes (default: 8).
 uvx check_bag directory --folder --max-workers 8
