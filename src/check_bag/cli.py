@@ -354,6 +354,10 @@ def check_folder(
 
     def summary() -> None:
         total = time.perf_counter() - start
+        if failures:
+            print(f"failed bags ({len(failures)}):", file=sys.stderr)
+            for bag, error in sorted(failures):
+                print(f"  {bag}: {error}", file=sys.stderr)
         if not quiet:
             print(
                 f"checked {len(bags)} bags: {len(bags) - len(failures)} ok,"

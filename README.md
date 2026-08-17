@@ -32,6 +32,8 @@ uncompressed, larger before smaller), so every worker stays busy until the
 whole queue drains. ROS2 bags each run as a single-process task in the same
 pool and are submitted first so they overlap the chunk work. Each result line
 reports the per-bag processing time, and the summary reports the total time.
+Any bags that failed are listed again at the end of the run, so failures are
+easy to find in a long log.
 Setting `--max-workers` to the number of CPU cores gives the fastest checks
 for compressed bags.
 
