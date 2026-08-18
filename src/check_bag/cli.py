@@ -59,13 +59,54 @@ def format_info(reader: AnyReader, path: Path) -> str:
     return "\n".join(lines)
 
 
-def check_messages(reader: AnyReader, *, deserialize: bool, quiet: bool) -> None:
+CAMERA_MSGTYPES = frozenset(
+    {"sensor_msgs/msg/CameraInfo", "sensor_msgs/msg/Image", "sensor_msgs/msg/CompressedImage"}
+)
+
+
+def is_camera_msgtype(msgtype: str) -> bool:
+    """Report whether a message type is one of the camera types.
+
+    Accepts both the ROS1 ('sensor_msgs/Image') and normalized
+    ('sensor_msgs/msg/Image') spellings.
+    """
+    package, _, name = msgtype.rpartition("/")
+    return f"{package.removesuffix('/msg')}/msg/{name}" in CAMERA_MSGTYPES
+
+
+def read_last(reader: AnyReader, connections: list) -> tuple | None:
+    """Return the last message of the given connections, or None.
+
+    Reads a window at the end of the bag, widening it until a message is
+    found, so excluded topics at the end of the bag do not hide it.
+    """
+    span = max(1, reader.end_time - reader.start_time)
+    window = 1
+    while True:
+        last = None
+        for entry in reader.messages(connections=connections, start=reader.end_time - window):
+            last = entry
+        if last is not None or window > span:
+            return last
+        window *= 8
+
+
+def check_messages(
+    reader: AnyReader, *, deserialize: bool, quiet: bool, exclude_camera: bool = False
+) -> None:
     """Read all messages in the bag, optionally deserializing them.
 
     Raises on any read or deserialization error.
     """
     start = time.perf_counter()
     connections = list(reader.connections)
+
+    if exclude_camera:
+        excluded = sorted({c.msgtype for c in connections if is_camera_msgtype(c.msgtype)})
+        connections = [c for c in connections if not is_camera_msgtype(c.msgtype)]
+        if excluded and not quiet:
+            for msgtype in excluded:
+                print(f"excluding camera type: {msgtype}")
 
     if deserialize:
         known = reader.typestore.fielddefs
@@ -90,24 +131,28 @@ def check_messages(reader: AnyReader, *, deserialize: bool, quiet: bool) -> None
         print(f"OK: {mode} {count} messages ({time.perf_counter() - start:.1f}s)")
 
 
-def check_quick(reader: AnyReader, *, deserialize: bool, quiet: bool) -> None:
+def check_quick(
+    reader: AnyReader, *, deserialize: bool, quiet: bool, exclude_camera: bool = False
+) -> None:
     """Check that the bag opens and its first and last messages are valid.
 
     Raises on any read or deserialization error.
     """
     start = time.perf_counter()
-    if reader.message_count == 0:
+    connections = list(reader.connections)
+    if exclude_camera:
+        connections = [c for c in connections if not is_camera_msgtype(c.msgtype)]
+    expected = sum(c.msgcount for c in connections)
+    if expected == 0:
         if not quiet:
             print(f"OK: quick check, bag opened (no messages) ({time.perf_counter() - start:.1f}s)")
         return
 
-    first = next(reader.messages(), None)
+    first = next(reader.messages(connections=connections), None)
     if first is None:
         msg = "bag index reports messages but none could be read"
         raise ValueError(msg)
-    last = None
-    for entry in reader.messages(start=reader.end_time - 1):
-        last = entry
+    last = read_last(reader, connections)
     if last is None:
         msg = "could not read the last message"
         raise ValueError(msg)
@@ -121,7 +166,7 @@ def check_quick(reader: AnyReader, *, deserialize: bool, quiet: bool) -> None:
     if not quiet:
         mode = "valid" if not deserialize else "deserialized"
         print(
-            f"OK: quick check, first and last of {reader.message_count} messages {mode}"
+            f"OK: quick check, first and last of {expected} messages {mode}"
             f" ({time.perf_counter() - start:.1f}s)"
         )
 
@@ -135,7 +180,13 @@ _worker_files: dict[str, object] = {}
 _worker_readers: dict[str, tuple] = {}
 
 
-def _scan_chunk(buf: bytes, reader: AnyReader | None, msgtypes: dict[int, str], deserialize: bool) -> int:
+def _scan_chunk(
+    buf: bytes,
+    reader: AnyReader | None,
+    msgtypes: dict[int, str],
+    deserialize: bool,
+    excluded: frozenset[int] = frozenset(),
+) -> int:
     """Parse all records in a decompressed ROS1 chunk.
 
     Returns the number of message records; raises on malformed data.
@@ -168,7 +219,7 @@ def _scan_chunk(buf: bytes, reader: AnyReader | None, msgtypes: dict[int, str], 
         if pos + dlen > end:
             msg = "record data exceeds chunk size"
             raise ValueError(msg)
-        if op == MSGDATA_OP:
+        if op == MSGDATA_OP and conn not in excluded:
             count += 1
             if deserialize:
                 msgtype = msgtypes.get(conn)
@@ -178,7 +229,12 @@ def _scan_chunk(buf: bytes, reader: AnyReader | None, msgtypes: dict[int, str], 
     return count
 
 
-def scan_ros1_batch(bag: str, deserialize: bool, chunks: list[tuple[int, int, str]]) -> int:
+def scan_ros1_batch(
+    bag: str,
+    deserialize: bool,
+    chunks: list[tuple[int, int, str]],
+    excluded: frozenset[int] = frozenset(),
+) -> int:
     """Worker: decompress and scan a batch of chunks, return message count.
 
     Each chunk is described as (datapos, datasize, compression). Without
@@ -209,11 +265,15 @@ def scan_ros1_batch(bag: str, deserialize: bool, chunks: list[tuple[int, int, st
         if len(data) != datasize:
             msg = f"chunk at offset {datapos} is truncated"
             raise ValueError(msg)
-        count += _scan_chunk(ros1_decompressors[compression](data), reader, msgtypes, deserialize)
+        count += _scan_chunk(
+            ros1_decompressors[compression](data), reader, msgtypes, deserialize, excluded
+        )
     return count
 
 
-def check_ros1_parallel(path: Path, *, deserialize: bool, quiet: bool, max_workers: int) -> None:
+def check_ros1_parallel(
+    path: Path, *, deserialize: bool, quiet: bool, max_workers: int, exclude_camera: bool = False
+) -> None:
     """Check a ROS1 bag by scanning its chunks with a pool of worker processes.
 
     Raises on any read or deserialization error, and on a mismatch between
@@ -221,12 +281,20 @@ def check_ros1_parallel(path: Path, *, deserialize: bool, quiet: bool, max_worke
     """
     start = time.perf_counter()
     compression_names = {id(func): name for name, func in ros1_decompressors.items()}
+    excluded: frozenset[int] = frozenset()
     with open_bag(path) as reader:
         expected = reader.message_count
         chunks = [
             (chunk.datapos, chunk.datasize, compression_names[id(chunk.decompressor)])
             for _, chunk in sorted(reader.readers[0].chunks.items())
         ]
+        if exclude_camera:
+            cameras = [c for c in reader.connections if is_camera_msgtype(c.msgtype)]
+            excluded = frozenset(c.id for c in cameras)
+            expected -= sum(c.msgcount for c in cameras)
+            if cameras and not quiet:
+                for msgtype in sorted({c.msgtype for c in cameras}):
+                    print(f"excluding camera type: {msgtype}")
         if deserialize:
             known = reader.typestore.fielddefs
             unknown = sorted({c.msgtype for c in reader.connections if c.msgtype not in known})
@@ -239,7 +307,7 @@ def check_ros1_parallel(path: Path, *, deserialize: bool, quiet: bool, max_worke
     count = 0
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(scan_ros1_batch, str(path), deserialize, batch): len(batch)
+            executor.submit(scan_ros1_batch, str(path), deserialize, batch, excluded): len(batch)
             for batch in batches
         }
         with tqdm(total=len(chunks), unit="chunk", disable=quiet) as progress:
@@ -305,7 +373,12 @@ def find_bags(folder: Path) -> list[Path]:
 
 
 def process_bag(
-    bag: str, deserialize: bool, info: bool, announce: bool = False, quick: bool = False
+    bag: str,
+    deserialize: bool,
+    info: bool,
+    announce: bool = False,
+    quick: bool = False,
+    exclude_camera: bool = False,
 ) -> tuple[str, str | None, str | None, float]:
     """Worker: check a single bag. Returns (bag, error, info_text, elapsed)."""
     path = Path(bag)
@@ -317,9 +390,13 @@ def process_bag(
             if info:
                 return bag, None, format_info(reader, path), time.perf_counter() - start
             if quick:
-                check_quick(reader, deserialize=deserialize, quiet=True)
+                check_quick(
+                    reader, deserialize=deserialize, quiet=True, exclude_camera=exclude_camera
+                )
             else:
-                check_messages(reader, deserialize=deserialize, quiet=True)
+                check_messages(
+                    reader, deserialize=deserialize, quiet=True, exclude_camera=exclude_camera
+                )
     except Exception as exc:  # noqa: BLE001 - any failure means the bag is invalid
         return bag, str(exc), None, time.perf_counter() - start
     return bag, None, None, time.perf_counter() - start
@@ -333,6 +410,7 @@ def check_folder(
     quick: bool,
     quiet: bool,
     max_workers: int,
+    exclude_camera: bool = False,
 ) -> int:
     """Check all bags found under a folder.
 
@@ -387,7 +465,9 @@ def check_folder(
     if quick:
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             quick_futures = [
-                executor.submit(process_bag, str(bag), deserialize, False, not quiet, True)
+                executor.submit(
+                    process_bag, str(bag), deserialize, False, not quiet, True, exclude_camera
+                )
                 for bag in bags
             ]
             with tqdm(total=len(bags), unit="bag", disable=quiet) as progress:
@@ -436,7 +516,9 @@ def check_folder(
         tqdm(total=0, unit="chunk", disable=quiet) as progress,
     ):
         for path in ros2_paths:
-            future = executor.submit(process_bag, str(path), deserialize, False, not quiet)
+            future = executor.submit(
+                process_bag, str(path), deserialize, False, not quiet, False, exclude_camera
+            )
             futures[future] = ("ros2", str(path), 0)
 
         for path in ros1_ordered:
@@ -446,6 +528,7 @@ def check_folder(
             state = {"pending": 0, "count": 0, "expected": 0, "error": None,
                      "start": time.perf_counter(), "futures": []}
             bag_state[bag] = state
+            excluded: frozenset[int] = frozenset()
             try:
                 with open_bag(path) as reader:
                     state["expected"] = reader.message_count
@@ -453,6 +536,10 @@ def check_folder(
                         (chunk.datapos, chunk.datasize, compression_names[id(chunk.decompressor)])
                         for _, chunk in sorted(reader.readers[0].chunks.items())
                     ]
+                    if exclude_camera:
+                        cameras = [c for c in reader.connections if is_camera_msgtype(c.msgtype)]
+                        excluded = frozenset(c.id for c in cameras)
+                        state["expected"] -= sum(c.msgcount for c in cameras)
                     if deserialize:
                         known = reader.typestore.fielddefs
                         unknown = sorted(
@@ -468,7 +555,7 @@ def check_folder(
             batches = [chunks[i : i + batchsize] for i in range(0, len(chunks), batchsize)]
             state["pending"] = len(batches)
             for batch in batches:
-                future = executor.submit(scan_ros1_batch, bag, deserialize, batch)
+                future = executor.submit(scan_ros1_batch, bag, deserialize, batch, excluded)
                 futures[future] = ("ros1", bag, len(batch))
                 state["futures"].append(future)
             progress.total += len(chunks)
@@ -520,6 +607,11 @@ def main() -> int:
     parser.add_argument("--de", action="store_true", help="deserialize messages (non-standard types are ignored)")
     parser.add_argument("--info", action="store_true", help="show meta information of the bag")
     parser.add_argument(
+        "--exclude-camera",
+        action="store_true",
+        help="skip sensor_msgs CameraInfo, Image, and CompressedImage messages",
+    )
+    parser.add_argument(
         "--quick",
         action="store_true",
         help="check only that the bag opens and its first and last messages are valid",
@@ -557,22 +649,33 @@ def main() -> int:
             quick=args.quick,
             quiet=args.quiet,
             max_workers=args.max_workers,
+            exclude_camera=args.exclude_camera,
         )
 
     try:
         if not args.info and not args.quick and args.bag.is_file() and args.max_workers > 1:
             # ROS1 bags are single files; scan their chunks in parallel.
             check_ros1_parallel(
-                args.bag, deserialize=args.de, quiet=args.quiet, max_workers=args.max_workers
+                args.bag,
+                deserialize=args.de,
+                quiet=args.quiet,
+                max_workers=args.max_workers,
+                exclude_camera=args.exclude_camera,
             )
             return 0
         with open_bag(args.bag) as reader:
             if args.info:
                 print(format_info(reader, args.bag))
             elif args.quick:
-                check_quick(reader, deserialize=args.de, quiet=args.quiet)
+                check_quick(
+                    reader, deserialize=args.de, quiet=args.quiet,
+                    exclude_camera=args.exclude_camera,
+                )
             else:
-                check_messages(reader, deserialize=args.de, quiet=args.quiet)
+                check_messages(
+                    reader, deserialize=args.de, quiet=args.quiet,
+                    exclude_camera=args.exclude_camera,
+                )
     except Exception as exc:  # noqa: BLE001 - any failure means the bag is invalid
         print(f"error: {exc}", file=sys.stderr)
         return 1

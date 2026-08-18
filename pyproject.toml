@@ -11,6 +11,7 @@ dependencies = [
 
 [project.scripts]
 check_bag = "check_bag.cli:main"
+decompress_bag = "check_bag.decompress:main"
 
 [build-system]
 requires = ["hatchling"]
